@@ -1,0 +1,161 @@
+name: Fork release
+
+# Builds any branch of this fork on a GitHub-hosted Mac and publishes the DMG as a
+# GitHub Release. Start it from Actions → Fork release → Run workflow.
+#
+# Keep this file on the fork's default branch: GitHub only shows the Run workflow
+# button for workflows there. Type the branch you want in "Branch, tag or commit to
+# build". Feature branches don't need the file, so pull requests upstream stay clean.
+#
+# How this differs from release.yml:
+#   · No Homebrew steps, so nothing is pushed to main or to the tap.
+#   · The app reports only the numeric part of the version you type. UpdateChecker
+#     compares versions number by number, so "2.0.6-fix29" would read as 2.0 and the
+#     app would offer to "update" to the official release.
+#   · The tag and release are created with GITHUB_TOKEN, which doesn't trigger other
+#     workflows, so release.yml and update-brew.yml stay idle.
+
+run-name: "${{ inputs.ref }} · ${{ inputs.publish }}${{ inputs.version && format(' · {0}', inputs.version) || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build"
+        required: true
+        default: main
+      version:
+        description: "Version, e.g. 2.0.6 or 2.0.6-fix29.1 (blank: project version + build number)"
+        required: false
+        default: ""
+      publish:
+        description: "Publish as"
+        type: choice
+        default: pre-release
+        options:
+          - pre-release
+          - release
+          - build only
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build MacMonitor
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out ${{ inputs.ref }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Work out the version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          PBXPROJ=Macmonitor.xcodeproj/project.pbxproj
+
+          BASE=$(sed -nE 's/.*MARKETING_VERSION = ([0-9]+(\.[0-9]+)*);.*/\1/p' "$PBXPROJ" | head -n 1)
+          if [ -z "$BASE" ]; then
+            echo "::error::Couldn't read MARKETING_VERSION from $PBXPROJ"
+            exit 1
+          fi
+
+          VERSION="${INPUT_VERSION//[[:space:]]/}"
+          VERSION="${VERSION#v}"
+          VERSION="${VERSION:-$BASE-build.$GITHUB_RUN_NUMBER}"
+          VALID='^[0-9]+(\.[0-9]+){1,2}(-[0-9A-Za-z.-]+)?$'
+          if ! [[ "$VERSION" =~ $VALID ]]; then
+            echo "::error::Version must look like 2.0.6 or 2.0.6-fix29.1, not '$VERSION'"
+            exit 1
+          fi
+          TAG="v$VERSION"
+
+          if [ "$PUBLISH" != "build only" ] && git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::$TAG already exists in this repository. Pick another version."
+            exit 1
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "app_version=${VERSION%%-*}"
+            echo "tag=$TAG"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $TAG from $(git rev-parse --short HEAD). The app will report ${VERSION%%-*}."
+
+      - name: Set the app version to ${{ steps.ver.outputs.app_version }}
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.app_version }}
+        run: |
+          perl -pi -e 's/MARKETING_VERSION = [^;]+;/MARKETING_VERSION = $ENV{APP_VERSION};/g' \
+            Macmonitor.xcodeproj/project.pbxproj
+          grep -n "MARKETING_VERSION" Macmonitor.xcodeproj/project.pbxproj
+
+      - name: Build the DMG
+        env:
+          CI: "true"
+          MACMONITOR_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x scripts/build-dmg.sh
+          ./scripts/build-dmg.sh
+
+      - name: Attach the DMG to this run
+        uses: actions/upload-artifact@v7
+        with:
+          name: MacMonitor-${{ steps.ver.outputs.version }}
+          path: dist/MacMonitor-*.dmg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish the ${{ inputs.publish }}
+        if: inputs.publish != 'build only'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ steps.ver.outputs.sha }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          REPO_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            echo "Built from \`$REF\` at $SHA by [workflow run #$GITHUB_RUN_NUMBER]($REPO_URL/actions/runs/$GITHUB_RUN_ID)."
+            echo
+            echo "Not an official MacMonitor release. Install it like one, following"
+            echo "[Manual DMG download]($REPO_URL/blob/$SHA/INSTALL.md#method-3--manual-dmg-download)."
+            echo "It installs over the official app; to go back, install an official release."
+          } > "$RUNNER_TEMP/notes.md"
+
+          if [ "$PUBLISH" = "pre-release" ]; then set -- --prerelease; else set --; fi
+          gh release create "$TAG" dist/MacMonitor-*.dmg \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "MacMonitor $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$@"
+
+      - name: Summary
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.app_version }}
+          PUBLISH: ${{ inputs.publish }}
+          REF: ${{ inputs.ref }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "### MacMonitor $VERSION"
+            echo "Built from \`$REF\`. The app reports version $APP_VERSION."
+            if [ "$PUBLISH" = "build only" ]; then
+              echo "Download the DMG from **Artifacts** at the bottom of this page."
+            else
+              echo "Download it from the [$PUBLISH]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) or from **Artifacts** below."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
